@@ -1,5 +1,5 @@
 import { notFound } from "next/navigation";
-import { MenuForm } from "@/components/admin/menu-form";
+import { MenuForm, type MenuFormValues } from "@/components/admin/menu-form";
 import { getCategories } from "@/lib/categories";
 import { getMenuItem } from "@/lib/menu";
 import { serializePrisma } from "@/lib/serialize";
@@ -14,17 +14,17 @@ export default async function EditMenuItemPage({
 
   if (!item) notFound();
 
-  const initialValues = serializePrisma({
+  const initialValues: MenuFormValues = {
     id: item.id,
     name: item.name,
     description: item.description ?? "",
-    price: item.price,
+    price: Number(item.price),
     categoryId: item.categoryId,
     imageUrl: item.imageUrl ?? "",
     isAvailable: item.isAvailable,
     isBestSeller: item.isBestSeller,
     isNew: item.isNew,
-  });
+  };
 
   return (
     <main className="mx-auto max-w-3xl px-6 py-8">

@@ -1,8 +1,8 @@
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { getInventoryItem } from "@/lib/inventory";
-import { serializePrisma } from "@/lib/serialize";
 import { InventoryEditPanel } from "@/components/admin/inventory-edit-panel";
+import type { InventoryFormValues } from "@/components/admin/inventory-form";
 
 export default async function EditInventoryItemPage({
   params,
@@ -13,15 +13,15 @@ export default async function EditInventoryItemPage({
   const item = await getInventoryItem(id);
   if (!item) notFound();
 
-  const initialValues = serializePrisma({
+  const initialValues: InventoryFormValues = {
     id: item.id,
     name: item.name,
     category: item.category,
     unit: item.unit,
-    quantityOnHand: item.quantityOnHand,
-    reorderThreshold: item.reorderThreshold,
-    unitCost: item.unitCost ?? "",
-  });
+    quantityOnHand: Number(item.quantityOnHand),
+    reorderThreshold: Number(item.reorderThreshold),
+    unitCost: item.unitCost !== null ? Number(item.unitCost) : "",
+  };
 
   return (
     <main className="mx-auto max-w-3xl px-6 py-8">
