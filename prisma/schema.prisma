@@ -1,0 +1,323 @@
+// KUY'S Tapsihan Smart Ordering System
+// Prisma schema — PostgreSQL (Neon), designed for Vercel deployment.
+//
+// Connection strategy for Neon + Vercel:
+//   DATABASE_URL -> pooled connection (via PgBouncer, used at runtime by the app)
+//   DIRECT_URL   -> direct connection (used only by Prisma Migrate/CLI)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  ADMIN // Eatery owner — full access
+  STAFF // Kitchen staff — order queue + status updates
+}
+
+enum OrderChannel {
+  KIOSK // Self-service kiosk, dine-in
+  QR // QR code order-to-go / at-table
+}
+
+enum OrderStatus {
+  PENDING // Just placed, awaiting kitchen confirmation
+  CONFIRMED // Kitchen has accepted the order
+  PREPARING // Being cooked
+  READY // Ready for pickup/serving
+  COMPLETED // Handed to customer
+  CANCELLED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PAID
+  REFUNDED
+}
+
+enum PaymentMethod {
+  CASH
+  GCASH
+  MAYA
+  CARD
+}
+
+enum InventoryTransactionType {
+  DEDUCTION // Auto-deducted because an order was placed
+  RESTOCK // Admin added stock
+  ADJUSTMENT // Manual correction (waste, spoilage, recount)
+  RETURN // Stock returned because an order was cancelled
+}
+
+// ---------------------------------------------------------------------------
+// Auth / Users (Admin + Staff only — customers order as guests)
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String
+  email         String    @unique
+  passwordHash  String
+  role          Role      @default(STAFF)
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Used only to show an informational "you're also signed in elsewhere"
+  // notice at login time — not a hard single-session enforcement mechanism.
+  lastLoginAt        DateTime?
+  lastLoginUserAgent String?
+
+  ordersHandled Order[]   @relation("OrderHandledBy")
+
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Menu
+// ---------------------------------------------------------------------------
+
+model Category {
+  id        String     @id @default(cuid())
+  name      String     @unique // e.g. "Silog Meals", "Beverages", "Add-ons"
+  sortOrder Int        @default(0)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  menuItems MenuItem[]
+
+  @@map("categories")
+}
+
+model MenuItem {
+  id            String              @id @default(cuid())
+  name          String // e.g. "Tapsilog", "Longsilog", "Hotsilog"
+  description   String?
+  price         Decimal             @db.Decimal(10, 2)
+  imageUrl      String?
+  isAvailable   Boolean             @default(true)
+  isBestSeller  Boolean             @default(false)
+  isNew         Boolean             @default(false)
+  sortOrder     Int                 @default(0)
+  categoryId    String
+  deletedAt     DateTime? // soft-deleted when the item has order history
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  category      Category            @relation(fields: [categoryId], references: [id])
+  orderItems    OrderItem[]
+  ingredients   MenuItemIngredient[] // recipe: what inventory this item consumes
+  comboAppearances ComboMealItem[] // combo meals that include this item
+
+  @@index([categoryId])
+  @@index([deletedAt])
+  @@map("menu_items")
+}
+
+// ---------------------------------------------------------------------------
+// Add-ons + Combo meals (kiosk/QR ordering)
+// ---------------------------------------------------------------------------
+
+// Global add-on catalog (applies to any menu item) — e.g. "Extra Rice",
+// "Egg", "Iced Tea". Kept flat/global rather than per-item so the same
+// short list shows for every item, matching how a small tapsihan actually
+// upsells at the counter.
+model AddOn {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  price       Decimal  @db.Decimal(10, 2)
+  isAvailable Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // No relation to OrderItemAddOn on purpose — order lines snapshot the
+  // add-on's name/price at order time (see OrderItemAddOn), so a later
+  // edit or deletion here never rewrites a past receipt.
+
+  @@map("add_ons")
+}
+
+// A bundled meal sold at its own (usually discounted) price — e.g.
+// "Tapsilog + Drink Combo". `items` lists what's included.
+model ComboMeal {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  imageUrl    String?
+  price       Decimal  @db.Decimal(10, 2)
+  isAvailable Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  items      ComboMealItem[]
+  orderItems OrderItem[]
+
+  @@map("combo_meals")
+}
+
+model ComboMealItem {
+  id          String @id @default(cuid())
+  comboMealId String
+  menuItemId  String
+  quantity    Int    @default(1)
+
+  comboMeal ComboMeal @relation(fields: [comboMealId], references: [id], onDelete: Cascade)
+  menuItem  MenuItem  @relation(fields: [menuItemId], references: [id])
+
+  @@unique([comboMealId, menuItemId])
+  @@map("combo_meal_items")
+}
+
+// Recipe / bill-of-materials linking a menu item to the inventory it consumes.
+// e.g. "Tapsilog" -> 1x Beef Tapa portion, 1x Rice cup, 1x Egg
+model MenuItemIngredient {
+  id              String        @id @default(cuid())
+  menuItemId      String
+  inventoryItemId String
+  quantityUsed    Decimal       @db.Decimal(10, 3) // amount consumed per 1 order of this menu item
+
+  menuItem        MenuItem      @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
+
+  @@unique([menuItemId, inventoryItemId])
+  @@map("menu_item_ingredients")
+}
+
+// ---------------------------------------------------------------------------
+// Inventory
+// ---------------------------------------------------------------------------
+
+model InventoryItem {
+  id                String                @id @default(cuid())
+  name              String                @unique // e.g. "Beef Tapa", "Rice", "Egg", "Longganisa"
+  category          String                @default("Uncategorized") // e.g. "Meat", "Produce", "Dry Goods", "Beverages"
+  unit              String // e.g. "pcs", "kg", "cup", "g"
+  quantityOnHand    Decimal               @db.Decimal(10, 3)
+  reorderThreshold  Decimal               @db.Decimal(10, 3) @default(0)
+  unitCost          Decimal?              @db.Decimal(10, 2) // cost per unit, used for recipe costing
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  usedIn            MenuItemIngredient[]
+  transactions      InventoryTransaction[]
+
+  @@index([category])
+  @@map("inventory_items")
+}
+
+model InventoryTransaction {
+  id              String                    @id @default(cuid())
+  inventoryItemId String
+  orderId         String? // set when type = DEDUCTION or RETURN
+  type            InventoryTransactionType
+  quantity        Decimal                   @db.Decimal(10, 3) // always positive; `type` gives direction
+  note            String?
+  createdAt       DateTime                  @default(now())
+
+  inventoryItem   InventoryItem             @relation(fields: [inventoryItemId], references: [id])
+  order           Order?                    @relation(fields: [orderId], references: [id])
+
+  @@index([inventoryItemId])
+  @@index([orderId])
+  @@map("inventory_transactions")
+}
+
+// ---------------------------------------------------------------------------
+// Dine-in tables (kiosk seating) + QR order-to-go tokens
+// ---------------------------------------------------------------------------
+
+model DiningTable {
+  id           String   @id @default(cuid())
+  tableNumber  String   @unique // e.g. "T1", "T2"
+  qrCodeToken  String   @unique @default(cuid()) // encoded in the table's printed QR
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  orders       Order[]
+
+  @@map("dining_tables")
+}
+
+// ---------------------------------------------------------------------------
+// Orders
+// ---------------------------------------------------------------------------
+
+model Order {
+  id             String                 @id @default(cuid())
+  orderNumber    String                 @unique // human-friendly daily sequence, e.g. "A-0042"
+  channel        OrderChannel
+  status         OrderStatus            @default(PENDING)
+  paymentStatus  PaymentStatus          @default(UNPAID)
+  paymentMethod  PaymentMethod?
+
+  tableId        String? // set for KIOSK dine-in orders
+  customerName   String? // optional, mainly for QR order-to-go pickup calls
+
+  subtotal       Decimal                @db.Decimal(10, 2)
+  totalAmount    Decimal                @db.Decimal(10, 2)
+  notes          String?
+
+  handledById    String? // staff member who last updated status
+  printedAt      DateTime? // when the receipt/kitchen slip was sent to the thermal printer
+
+  createdAt      DateTime               @default(now())
+  updatedAt      DateTime               @updatedAt
+
+  table          DiningTable?           @relation(fields: [tableId], references: [id])
+  handledBy      User?                  @relation("OrderHandledBy", fields: [handledById], references: [id])
+  items          OrderItem[]
+  inventoryMoves InventoryTransaction[]
+
+  @@index([status])
+  @@index([channel])
+  @@index([createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id          String   @id @default(cuid())
+  orderId     String
+  menuItemId  String? // set for a regular menu item line
+  comboMealId String? // set instead of menuItemId for a combo meal line
+  quantity    Int
+  unitPrice   Decimal  @db.Decimal(10, 2) // price snapshot at time of order (menu item OR combo, excludes add-ons)
+  subtotal    Decimal  @db.Decimal(10, 2) // (unitPrice + sum of add-on prices) * quantity
+  notes       String? // e.g. "no onions"
+
+  order     Order            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItem  MenuItem?        @relation(fields: [menuItemId], references: [id])
+  comboMeal ComboMeal?       @relation(fields: [comboMealId], references: [id])
+  addOns    OrderItemAddOn[]
+
+  @@index([orderId])
+  @@index([menuItemId])
+  @@index([comboMealId])
+  @@map("order_items")
+}
+
+// Selected add-ons for one order line, snapshotted at order time so a later
+// price change to the AddOn catalog never rewrites past receipts.
+model OrderItemAddOn {
+  id          String  @id @default(cuid())
+  orderItemId String
+  name        String
+  price       Decimal @db.Decimal(10, 2)
+  quantity    Int     @default(1)
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@index([orderItemId])
+  @@map("order_item_add_ons")
+}
